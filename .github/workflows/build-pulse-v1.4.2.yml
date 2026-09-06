@@ -1,0 +1,51 @@
+name: Build Pulse Macro v1.4.2 Win64
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'PulseMacro-source-v1.4.2.zip'
+      - '.github/workflows/build-pulse-v1.4.2.yml'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract Pulse Macro source
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'PulseMacro-source-v1.4.2.zip')) {
+            throw 'PulseMacro-source-v1.4.2.zip is missing from the repository root.'
+          }
+          if (Test-Path 'pulse-src') { Remove-Item -Recurse -Force 'pulse-src' }
+          Expand-Archive -Path 'PulseMacro-source-v1.4.2.zip' -DestinationPath 'pulse-src'
+          if (!(Test-Path 'pulse-src/PulseMacro-source-v1.4.2/CMakeLists.txt')) {
+            throw 'Unexpected ZIP layout: CMakeLists.txt not found.'
+          }
+
+      - name: Configure standalone tests
+        run: cmake -S pulse-src/PulseMacro-source-v1.4.2 -B pulse-src/PulseMacro-source-v1.4.2/build-core -DPULSE_CORE_ONLY=ON -DBUILD_TESTING=ON
+
+      - name: Build standalone tests
+        run: cmake --build pulse-src/PulseMacro-source-v1.4.2/build-core --config Release
+
+      - name: Run standalone tests
+        run: ctest --test-dir pulse-src/PulseMacro-source-v1.4.2/build-core -C Release --output-on-failure
+
+      - name: Build Pulse Macro Win64
+        id: geode-build
+        uses: geode-sdk/build-geode-mod@main
+        with:
+          sdk: v5.10.1
+          target: Win64
+          build-config: Release
+          configure-args: -DBUILD_TESTING=OFF
+          path: pulse-src/PulseMacro-source-v1.4.2
+
+      - name: Upload .geode artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PulseMacro-v1.4.2-Win64
+          path: ${{ steps.geode-build.outputs.build-output }}
