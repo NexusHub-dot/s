@@ -1,40 +1,131 @@
-name: Build Pulse Macro v1.4.2 Win64
+name: Build Geode Mod Win64
 
 on:
   workflow_dispatch:
   push:
-    paths:
-      - 'PulseMacro-source-v1.4.2.zip'
-      - '.github/workflows/build-pulse-v1.4.2.yml'
+    branches: [ main ]
 
 jobs:
   build:
     runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - name: Extract Pulse Macro source
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find source to build
+        id: find-source
         shell: pwsh
         run: |
-          if (!(Test-Path 'PulseMacro-source-v1.4.2.zip')) {
-            throw 'PulseMacro-source-v1.4.2.zip is missing from the repository root.'
+          $ErrorActionPreference = 'Stop'
+
+          # 1) Prefer a Geode project already extracted in the repository.
+          # A project is recognized by having BOTH CMakeLists.txt and mod.json.
+          $candidates = Get-ChildItem -Path . -Recurse -File -Filter 'CMakeLists.txt' |
+            Where-Object {
+              $_.FullName -notmatch '\\(build|build-core|build-release|_build|\.git)\\'
+            } |
+            ForEach-Object {
+              $dir = $_.Directory.FullName
+              if (Test-Path (Join-Path $dir 'mod.json')) { $dir }
+            } |
+            Select-Object -Unique
+
+          if ($candidates.Count -gt 0) {
+            # Prefer repo root if it is itself a Geode project.
+            $root = (Resolve-Path '.').Path
+            $source = $candidates | Where-Object { $_ -eq $root } | Select-Object -First 1
+            if (-not $source) {
+              if ($candidates.Count -gt 1) {
+                Write-Host 'Found multiple extracted Geode projects:'
+                $candidates | ForEach-Object { Write-Host "  $_" }
+                throw 'Keep only one Geode project in the repo, or put the project at the repo root.'
+              }
+              $source = $candidates[0]
+            }
           }
-          if (Test-Path 'pulse-src') { Remove-Item -Recurse -Force 'pulse-src' }
-          Expand-Archive -Path 'PulseMacro-source-v1.4.2.zip' -DestinationPath 'pulse-src'
-          if (!(Test-Path 'pulse-src/PulseMacro-source-v1.4.2/CMakeLists.txt')) {
-            throw 'Unexpected ZIP layout: CMakeLists.txt not found.'
+          else {
+            # 2) Otherwise accept ONE source ZIP placed anywhere in the repo.
+            # The ZIP may contain a top-level folder; we search inside after extraction.
+            $zips = Get-ChildItem -Path . -Recurse -File -Filter '*.zip' |
+              Where-Object {
+                $_.FullName -notmatch '\\(build|build-core|build-release|_build|\.git)\\'
+              }
+
+            if ($zips.Count -eq 0) {
+              throw 'No Geode source found. Upload either an extracted project containing CMakeLists.txt + mod.json, or one source .zip.'
+            }
+            if ($zips.Count -gt 1) {
+              Write-Host 'Found multiple ZIP files:'
+              $zips | ForEach-Object { Write-Host "  $($_.FullName)" }
+              throw 'Please keep only one source ZIP in the repository so the workflow knows which one to build.'
+            }
+
+            $extractRoot = Join-Path $env:RUNNER_TEMP 'geode-source'
+            if (Test-Path $extractRoot) { Remove-Item -Recurse -Force $extractRoot }
+            New-Item -ItemType Directory -Path $extractRoot | Out-Null
+            Expand-Archive -Path $zips[0].FullName -DestinationPath $extractRoot -Force
+
+            $inside = Get-ChildItem -Path $extractRoot -Recurse -File -Filter 'CMakeLists.txt' |
+              ForEach-Object {
+                $dir = $_.Directory.FullName
+                if (Test-Path (Join-Path $dir 'mod.json')) { $dir }
+              } |
+              Select-Object -Unique
+
+            if ($inside.Count -eq 0) {
+              throw 'The ZIP does not contain a Geode project with CMakeLists.txt + mod.json.'
+            }
+            if ($inside.Count -gt 1) {
+              Write-Host 'Found multiple Geode projects inside the ZIP:'
+              $inside | ForEach-Object { Write-Host "  $_" }
+              throw 'The ZIP must contain exactly one Geode project.'
+            }
+            $source = $inside[0]
           }
 
-      - name: Configure standalone tests
-        run: cmake -S pulse-src/PulseMacro-source-v1.4.2 -B pulse-src/PulseMacro-source-v1.4.2/build-core -DPULSE_CORE_ONLY=ON -DBUILD_TESTING=ON
+          $source = (Resolve-Path $source).Path
+          Write-Host "Building source: $source"
+          "SRC_DIR=$source" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Build standalone tests
-        run: cmake --build pulse-src/PulseMacro-source-v1.4.2/build-core --config Release
+          # Pulse Macro has standalone core tests behind PULSE_CORE_ONLY.
+          # Run them only when this project actually declares/uses that option.
+          $cmakeText = Get-Content (Join-Path $source 'CMakeLists.txt') -Raw
+          $runCore = $cmakeText -match 'PULSE_CORE_ONLY'
+          "RUN_CORE_TESTS=$($runCore.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Run standalone tests
-        run: ctest --test-dir pulse-src/PulseMacro-source-v1.4.2/build-core -C Release --output-on-failure
+          # Read mod id/version for a nicer artifact name when possible.
+          try {
+            $mod = Get-Content (Join-Path $source 'mod.json') -Raw | ConvertFrom-Json
+            $safeId = ($mod.id -replace '[^A-Za-z0-9._-]', '_')
+            $safeVersion = (($mod.version | Out-String).Trim() -replace '[^A-Za-z0-9._-]', '_')
+            if (-not $safeId) { $safeId = 'geode-mod' }
+            if (-not $safeVersion) { $safeVersion = 'build' }
+            "ARTIFACT_NAME=$safeId-$safeVersion-Win64" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+          catch {
+            "ARTIFACT_NAME=geode-mod-Win64" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
 
-      - name: Build Pulse Macro Win64
+      - name: Configure Pulse standalone tests
+        if: env.RUN_CORE_TESTS == 'true'
+        shell: pwsh
+        run: |
+          cmake -S "$env:SRC_DIR" -B "$env:RUNNER_TEMP/pulse-core-tests" -DPULSE_CORE_ONLY=ON -DBUILD_TESTING=ON
+
+      - name: Build Pulse standalone tests
+        if: env.RUN_CORE_TESTS == 'true'
+        shell: pwsh
+        run: |
+          cmake --build "$env:RUNNER_TEMP/pulse-core-tests" --config Release
+
+      - name: Run Pulse standalone tests
+        if: env.RUN_CORE_TESTS == 'true'
+        shell: pwsh
+        run: |
+          ctest --test-dir "$env:RUNNER_TEMP/pulse-core-tests" -C Release --output-on-failure
+
+      - name: Build Geode mod for Win64
         id: geode-build
         uses: geode-sdk/build-geode-mod@main
         with:
@@ -42,10 +133,46 @@ jobs:
           target: Win64
           build-config: Release
           configure-args: -DBUILD_TESTING=OFF
-          path: pulse-src/PulseMacro-source-v1.4.2
+          path: ${{ env.SRC_DIR }}
 
-      - name: Upload .geode artifact
+      - name: Collect .geode output
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'geode-artifact'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+
+          $files = @()
+          if ('${{ steps.geode-build.outputs.build-output }}') {
+            $reported = '${{ steps.geode-build.outputs.build-output }}'
+            if (Test-Path $reported) {
+              $item = Get-Item $reported
+              if ($item.PSIsContainer) {
+                $files += Get-ChildItem $reported -Recurse -File -Filter '*.geode'
+              } elseif ($item.Extension -eq '.geode') {
+                $files += $item
+              }
+            }
+          }
+
+          if ($files.Count -eq 0) {
+            $files = Get-ChildItem -Path "$env:SRC_DIR" -Recurse -File -Filter '*.geode' |
+              Where-Object { $_.FullName -notmatch '\\.git\\' }
+          }
+
+          $files = $files | Sort-Object FullName -Unique
+          if ($files.Count -eq 0) {
+            throw 'Build finished but no .geode package could be found.'
+          }
+
+          foreach ($file in $files) {
+            Copy-Item $file.FullName -Destination (Join-Path $out $file.Name) -Force
+            Write-Host "Collected: $($file.FullName)"
+          }
+
+      - name: Upload compiled .geode
         uses: actions/upload-artifact@v4
         with:
-          name: PulseMacro-v1.4.2-Win64
-          path: ${{ steps.geode-build.outputs.build-output }}
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ runner.temp }}/geode-artifact/*.geode
+          if-no-files-found: error
